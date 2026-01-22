@@ -1,0 +1,10 @@
+{
+  "name": "MedPredic",
+  "short_name": "MedPredict",
+  "description": "Professional AI-powered medical companion for symptom assessment and clinical report analysis.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}
