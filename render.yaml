@@ -1,0 +1,22 @@
+# Render Blueprint: deploys the FastAPI backend.
+# Put this file in the ROOT of your repo (next to package.json).
+services:
+  - type: web
+    name: medpredict-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: GEMINI_API_KEY
+        sync: false          # you type this in the Render dashboard; never commit it
+      - key: GEMINI_ANALYSIS_MODEL
+        value: gemini-3.6-flash
+      - key: GEMINI_MAPS_MODEL
+        value: gemini-3.6-flash
+      - key: CORS_ORIGINS
+        sync: false          # set to your Vercel URL after the frontend is deployed

@@ -65,8 +65,9 @@ const ReportAnalyzer: React.FC = () => {
       const result = await analyzeLabReport(base64);
       setReport(result);
     } catch (err) {
-      console.error(err);
-      setError('Analysis failed. The report might be blurry or the format is unsupported. Please try a clearer photo.');
+      console.error('Lab report analysis failed:', err);
+      const detail = err instanceof Error ? err.message : '';
+      setError(detail ? `Analysis failed: ${detail}` : 'Analysis failed. Please try again.');
     } finally {
       setLoading(false);
       clearInterval(stepInterval);
