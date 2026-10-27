@@ -1,20 +1,66 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# MedPredict AI — Healthcare Prediction
 
-# Run and deploy your AI Studio app
+AI-powered medical companion: symptom analysis, lab-report reading, nearby-care finder and a live voice consult.
 
-This contains everything you need to run your app locally.
+- **Frontend:** React + Vite + TypeScript
+- **Backend:** Python (FastAPI) + Google Gemini (`google-genai`)
 
-View your app in AI Studio: https://ai.studio/apps/drive/1cq7R-EcIiWbv5qQBD59j_i5TfqNWh90o
+The Gemini API key lives **only on the backend** (`backend/.env`). The browser never sees it.
 
-## Run Locally
+## Architecture
 
-**Prerequisites:**  Node.js
+```
+React (Vite :3000) ──/api/*──▶ FastAPI (:8000) ──▶ Gemini API
+        └──── WebSocket /api/live (voice) ─────────┘
+```
 
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/analyze-symptoms` | Structured symptom analysis (condition, urgency, recommendations) |
+| `POST /api/analyze-lab-report` | Reads a lab-report image and flags abnormal values |
+| `POST /api/find-care` | Nearby doctors/hospitals via Gemini + Google Maps grounding |
+| `WS   /api/live` | Real-time voice consult (browser mic ⇄ Gemini Live) |
+| `GET  /api/health` | Status + whether the key is configured |
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## Run locally
+
+**Prerequisites:** Node.js 18+, Python 3.10+, a [Gemini API key](https://aistudio.google.com/apikey)
+
+### 1. Backend
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env             # then put your key in GEMINI_API_KEY=
+python -m uvicorn app.main:app --reload --port 8000
+```
+Check it: http://localhost:8000/api/health → `"geminiConfigured": true`
+(interactive API docs at http://localhost:8000/docs)
+
+### 2. Frontend (new terminal, repo root)
+```bash
+npm install
+npm run dev
+```
+Open http://localhost:3000. Vite proxies `/api` to the backend automatically.
+
+### Tests
+```bash
+cd backend && python -m pytest -q
+```
+
+## Configuration (`backend/.env`)
+
+| Variable | Default |
+|---|---|
+| `GEMINI_API_KEY` | *(required)* |
+| `GEMINI_ANALYSIS_MODEL` | `gemini-3.6-flash` |
+| `GEMINI_MAPS_MODEL` | `gemini-3.6-flash` |
+| `GEMINI_LIVE_MODEL` | `gemini-2.5-flash-native-audio-preview-12-2025` |
+| `CARE_PROVIDER` | `osm` (free OpenStreetMap hospital search; `gemini` = Gemini Maps grounding, paid tier only) |
+| `CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` |
+
+For a deployed backend, build the frontend with `VITE_API_URL=https://your-api.example.com` and add the frontend origin to `CORS_ORIGINS`.
+
+> ⚠️ Not a medical device. AI output is informational only and is not a substitute for professional medical advice.

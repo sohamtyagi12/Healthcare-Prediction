@@ -1,37 +1,17 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { analyzeSymptoms, findSpecializedCare } from '../services/geminiService';
+import { analyzeSymptoms, findSpecializedCare, getLiveSocketUrl } from '../services/geminiService';
 import { AnalysisResult, UserProfile, HistoryItem } from '../types';
 import { Send, Loader2, Info, CheckCircle2, AlertCircle, MapPin, Mic, MicOff, Search, Compass, Hospital, ExternalLink, ChevronRight, Activity, X, Volume2 } from 'lucide-react';
 
-// Recommended manual encoding/decoding functions for Live API
-function encode(bytes: Uint8Array) {
-  let binary = '';
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-function decode(base64: string) {
-  const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes;
-}
-
+// Decode raw 16-bit PCM bytes from the backend into a playable AudioBuffer
 async function decodeAudioData(
   data: Uint8Array,
   ctx: AudioContext,
   sampleRate: number,
   numChannels: number,
 ): Promise<AudioBuffer> {
-  const dataInt16 = new Int16Array(data.buffer);
+  const dataInt16 = new Int16Array(data.buffer, data.byteOffset, Math.floor(data.byteLength / 2));
   const frameCount = dataInt16.length / numChannels;
   const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
 
@@ -59,18 +39,70 @@ const Assistant: React.FC<AssistantProps> = ({ user }) => {
   const [mapResults, setMapResults] = useState<{text: string, links: any[]} | null>(null);
   const [userLocation, setUserLocation] = useState<{lat: number, lng: number} | null>(null);
   const [locStatus, setLocStatus] = useState<'idle' | 'detecting' | 'success' | 'error'>('idle');
+  const [careLoading, setCareLoading] = useState(false);
+  const [careError, setCareError] = useState<string | null>(null);
 
   // Live Consult States
   const [isLiveActive, setIsLiveActive] = useState(false);
   const [liveStatus, setLiveStatus] = useState<'connecting' | 'listening' | 'speaking' | 'idle'>('idle');
   const audioContextRef = useRef<AudioContext | null>(null);
-  const sessionRef = useRef<any>(null);
+  const sessionRef = useRef<WebSocket | null>(null);
+  const liveCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    detectLocation();
+  }, []);
 
   useEffect(() => {
     if (activeTab === 'finder') {
       detectLocation();
     }
   }, [activeTab]);
+
+  // Resolve the user's position (reuse it if we already have it).
+  const getLocation = (): Promise<{ lat: number; lng: number } | null> =>
+    new Promise((resolve) => {
+      if (userLocation) return resolve(userLocation);
+      if (!navigator.geolocation) {
+        setLocStatus('error');
+        return resolve(null);
+      }
+      setLocStatus('detecting');
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          setUserLocation(loc);
+          setLocStatus('success');
+          resolve(loc);
+        },
+        () => {
+          setLocStatus('error');
+          resolve(null);
+        },
+        { timeout: 10000 }
+      );
+    });
+
+  // Hospitals near the user for the condition we just found. Failures here must never
+  // hide the symptom analysis, so this has its own error state.
+  const loadNearbyCare = async (res: AnalysisResult) => {
+    setMapResults(null);
+    setCareError(null);
+    setCareLoading(true);
+    try {
+      const loc = await getLocation();
+      if (!loc) {
+        setCareError('Allow location access in your browser to see hospitals near you.');
+        return;
+      }
+      const kind = res.urgency === 'Emergency' ? 'Emergency' : res.condition;
+      setMapResults(await findSpecializedCare(kind, loc.lat, loc.lng));
+    } catch {
+      setCareError('Could not load nearby hospitals right now.');
+    } finally {
+      setCareLoading(false);
+    }
+  };
 
   const detectLocation = () => {
     if (locStatus === 'success') return;
@@ -115,10 +147,7 @@ const Assistant: React.FC<AssistantProps> = ({ user }) => {
         }
       }
 
-      if (userLocation) {
-        const care = await findSpecializedCare(res.condition, userLocation.lat, userLocation.lng);
-        setMapResults(care);
-      }
+      void loadNearbyCare(res);
     } catch (error) {
       alert('Analysis encountered an issue. Please try again.');
     } finally {
@@ -126,77 +155,103 @@ const Assistant: React.FC<AssistantProps> = ({ user }) => {
     }
   };
 
+  const stopLiveConsult = () => {
+    liveCleanupRef.current?.();
+    liveCleanupRef.current = null;
+    setIsLiveActive(false);
+    setLiveStatus('idle');
+  };
+
+  // Release mic/audio/socket if the user navigates away mid-call
+  useEffect(() => () => { liveCleanupRef.current?.(); }, []);
+
   const startLiveConsult = async () => {
     setIsLiveActive(true);
     setLiveStatus('connecting');
 
+    let stream: MediaStream | null = null;
+    let inputCtx: AudioContext | null = null;
+    let outputCtx: AudioContext | null = null;
+    let processor: ScriptProcessorNode | null = null;
+    let ws: WebSocket | null = null;
+    const sources = new Set<AudioBufferSourceNode>();
+    let nextStartTime = 0;
+
+    const cleanup = () => {
+      processor?.disconnect();
+      stream?.getTracks().forEach(t => t.stop());
+      sources.forEach(s => { try { s.stop(); } catch { /* already stopped */ } });
+      sources.clear();
+      inputCtx?.close().catch(() => {});
+      outputCtx?.close().catch(() => {});
+      if (ws && ws.readyState <= WebSocket.OPEN) ws.close();
+      ws = null;
+      sessionRef.current = null;
+    };
+    liveCleanupRef.current = cleanup;
+
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      
-      const inputCtx = new AudioContext({ sampleRate: 16000 });
-      const outputCtx = new AudioContext({ sampleRate: 24000 });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      inputCtx = new AudioContext({ sampleRate: 16000 });
+      outputCtx = new AudioContext({ sampleRate: 24000 });
       audioContextRef.current = outputCtx;
 
-      let nextStartTime = 0;
-      const sources = new Set<AudioBufferSourceNode>();
+      // Audio goes browser -> our Python backend -> Gemini Live. No API key in the browser.
+      ws = new WebSocket(getLiveSocketUrl());
+      ws.binaryType = 'arraybuffer';
+      sessionRef.current = ws;
+      const socket = ws;
+      const inCtx = inputCtx;
+      const outCtx = outputCtx;
+      const micStream = stream;
 
-      const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
-        callbacks: {
-          onopen: () => {
+      socket.onmessage = async (event) => {
+        // Text frames are control messages; binary frames are 24 kHz PCM16 audio from Gemini.
+        if (typeof event.data === 'string') {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'ready') {
             setLiveStatus('listening');
-            const source = inputCtx.createMediaStreamSource(stream);
-            const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
-            
-            scriptProcessor.onaudioprocess = (e) => {
-              const inputData = e.inputBuffer.getChannelData(0);
-              const int16 = new Int16Array(inputData.length);
-              for (let i = 0; i < inputData.length; i++) {
-                int16[i] = inputData[i] * 32768;
+            const source = inCtx.createMediaStreamSource(micStream);
+            processor = inCtx.createScriptProcessor(4096, 1, 1);
+            processor.onaudioprocess = (e) => {
+              if (socket.readyState !== WebSocket.OPEN) return;
+              const input = e.inputBuffer.getChannelData(0);
+              const int16 = new Int16Array(input.length);
+              for (let i = 0; i < input.length; i++) {
+                const v = Math.max(-1, Math.min(1, input[i]));
+                int16[i] = v < 0 ? v * 32768 : v * 32767;
               }
-              const pcmData = new Uint8Array(int16.buffer);
-              const base64 = encode(pcmData);
-              sessionPromise.then(s => s.sendRealtimeInput({ 
-                media: { data: base64, mimeType: 'audio/pcm;rate=16000' } 
-              }));
+              socket.send(int16.buffer);
             };
-            source.connect(scriptProcessor);
-            scriptProcessor.connect(inputCtx.destination);
-          },
-          onmessage: async (message: LiveServerMessage) => {
-            const audioDataStr = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (audioDataStr) {
-              setLiveStatus('speaking');
-              const bytes = decode(audioDataStr);
-              const audioBuffer = await decodeAudioData(bytes, outputCtx, 24000, 1);
-
-              const source = outputCtx.createBufferSource();
-              source.buffer = audioBuffer;
-              source.connect(outputCtx.destination);
-              nextStartTime = Math.max(nextStartTime, outputCtx.currentTime);
-              source.start(nextStartTime);
-              nextStartTime += audioBuffer.duration;
-              source.onended = () => {
-                sources.delete(source);
-                if (sources.size === 0) setLiveStatus('listening');
-              };
-              sources.add(source);
-            }
-          },
-          onclose: () => setIsLiveActive(false),
-          onerror: () => setIsLiveActive(false),
-        },
-        config: {
-          responseModalities: [Modality.AUDIO],
-          systemInstruction: "You are MedPredict AI, a professional medical assistant. Provide concise, helpful health advice based on symptoms described. Keep it clinically focused. Remind users you are AI and not a doctor when giving medical advice.",
+            source.connect(processor);
+            processor.connect(inCtx.destination);
+          } else if (msg.type === 'error') {
+            console.error('Live consult error:', msg.message);
+            alert(msg.message || 'Live consult failed.');
+            stopLiveConsult();
+          }
+          return;
         }
-      });
 
-      sessionRef.current = await sessionPromise;
+        setLiveStatus('speaking');
+        const audioBuffer = await decodeAudioData(new Uint8Array(event.data as ArrayBuffer), outCtx, 24000, 1);
+        const source = outCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(outCtx.destination);
+        nextStartTime = Math.max(nextStartTime, outCtx.currentTime);
+        source.start(nextStartTime);
+        nextStartTime += audioBuffer.duration;
+        source.onended = () => {
+          sources.delete(source);
+          if (sources.size === 0) setLiveStatus('listening');
+        };
+        sources.add(source);
+      };
+      socket.onclose = () => { if (liveCleanupRef.current === cleanup) stopLiveConsult(); };
+      socket.onerror = () => { if (liveCleanupRef.current === cleanup) stopLiveConsult(); };
     } catch (e) {
       console.error(e);
-      setIsLiveActive(false);
+      stopLiveConsult();
     }
   };
 
@@ -250,7 +305,7 @@ const Assistant: React.FC<AssistantProps> = ({ user }) => {
                   </div>
                   <div>
                     <h2 className="text-xl font-black text-slate-800">Diagnostic Hub</h2>
-                    <p className="text-xs text-slate-400 font-bold uppercase tracking-widest mt-0.5">Gemini 3 Pro Active</p>
+                    <p className="text-xs text-slate-400 font-bold uppercase tracking-widest mt-0.5">Gemini 3.6 Flash Active</p>
                   </div>
                </div>
 
@@ -330,12 +385,50 @@ const Assistant: React.FC<AssistantProps> = ({ user }) => {
                      </div>
                    </div>
 
-                   {mapResults && (
+                   <div className="mt-6 bg-white p-6 rounded-3xl shadow-sm border border-slate-100">
+                     <h4 className="text-[10px] font-black text-blue-600 uppercase tracking-widest flex items-center gap-2 mb-4">
+                       <Hospital size={14} /> Hospitals Near You
+                     </h4>
+                     {careLoading && (
+                       <p className="text-xs text-slate-400 font-bold flex items-center gap-2">
+                         <Loader2 className="animate-spin" size={14} /> Finding hospitals near you...
+                       </p>
+                     )}
+                     {!careLoading && careError && (
+                       <p className="text-xs text-slate-500 font-medium">{careError}</p>
+                     )}
+                     {!careLoading && !careError && mapResults && mapResults.links.length === 0 && (
+                       <p className="text-xs text-slate-500 font-medium">{mapResults.text}</p>
+                     )}
+                     <ul className="space-y-3">
+                       {mapResults?.links.filter(l => l.maps).slice(0, 4).map((l, i) => (
+                         <li key={i} className="flex items-center justify-between gap-4">
+                           <div className="min-w-0">
+                             <p className="text-sm font-black text-slate-800 truncate">{l.maps.title}</p>
+                             <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                               {l.maps.distanceKm != null ? `${l.maps.distanceKm} km away` : 'Nearby'}
+                               {l.maps.emergency ? ' • Emergency' : ''}
+                             </p>
+                           </div>
+                           <a
+                             href={l.maps.uri}
+                             target="_blank"
+                             rel="noopener noreferrer"
+                             className="shrink-0 px-4 py-2 bg-slate-900 text-white rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 hover:bg-slate-800 transition-all"
+                           >
+                             Directions <ExternalLink size={12} />
+                           </a>
+                         </li>
+                       ))}
+                     </ul>
+                   </div>
+
+                   {mapResults && mapResults.links.length > 4 && (
                      <button 
                        onClick={() => setActiveTab('finder')}
                        className="w-full mt-6 py-4 bg-slate-900 text-white rounded-2xl font-black text-xs uppercase tracking-widest flex items-center justify-center gap-3 hover:bg-slate-800 transition-all"
                      >
-                       <MapPin size={16} /> View Nearby Specialists
+                       <MapPin size={16} /> View All Nearby Care
                      </button>
                    )}
                  </div>
@@ -372,7 +465,12 @@ const Assistant: React.FC<AssistantProps> = ({ user }) => {
                           <Hospital size={24} />
                        </div>
                        <h4 className="font-black text-slate-800 group-hover:text-blue-600 transition-colors">{result.maps.title}</h4>
-                       <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Medical Center</p>
+                       <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">
+                         {result.maps.distanceKm != null ? `${result.maps.distanceKm} km away` : 'Medical Center'}
+                       </p>
+                       {result.maps.address && (
+                         <p className="text-xs text-slate-500 font-medium mt-2">{result.maps.address}</p>
+                       )}
                        <a 
                          href={result.maps.uri} 
                          target="_blank" 
@@ -468,10 +566,7 @@ const Assistant: React.FC<AssistantProps> = ({ user }) => {
 
             <div className="flex justify-center gap-6">
                <button 
-                onClick={() => {
-                  sessionRef.current?.close();
-                  setIsLiveActive(false);
-                }}
+                onClick={stopLiveConsult}
                 className="w-16 h-16 bg-rose-600 text-white rounded-full flex items-center justify-center shadow-2xl shadow-rose-900/40 hover:bg-rose-500 transition-all active:scale-90"
                >
                  <X size={24} />
